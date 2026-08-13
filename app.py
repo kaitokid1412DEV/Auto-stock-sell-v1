@@ -1,30 +1,18 @@
-"""
-AI-assisted, risk-controlled NSE equity trading dashboard.
-
-Install:
-    pip install streamlit yfinance pandas numpy ta scikit-learn xgboost dhanhq plotly feedparser
-
-Secrets required:
-    APP_PASSWORD, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
-Optional secret:
-    LIVE_TRADING_ENABLED=true (otherwise signals are paper-only).
-
-Run:
-    streamlit run app.py
-"""
 from __future__ import annotations
 
 import hashlib
+import io
 import math
 import os
+import sys
 import uuid
 from datetime import datetime
 from typing import Any
+import xml.etree.ElementTree as ET
 
 import feedparser
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 import yfinance as yf
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
@@ -40,34 +28,42 @@ except ImportError:
     DhanContext = None
     dhanhq = None
 
-st.set_page_config(page_title="Quant Barrier Trader", page_icon="📈", layout="wide")
 
-# Expanded Top 50+ NSE Equities
-DEFAULT_TICKERS = [
-    "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
-    "BHARTIARTL.NS", "SBIN.NS", "LTIM.NS", "ITC.NS", "HINDUNILVR.NS",
-    "LT.NS", "AXISBANK.NS", "KOTAKBANK.NS", "HCLTECH.NS", "ADANIENT.NS",
-    "ADANIPORTS.NS", "SUNPHARMA.NS", "TITAN.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS",
-    "MARUTI.NS", "TATAMOTORS.NS", "TATASTEEL.NS", "NTPC.NS", "POWERGRID.NS",
-    "ULTRACEMCO.NS", "ASIANPAINT.NS", "COALINDIA.NS", "NESTLEIND.NS", "GRASIM.NS",
-    "JSWSTEEL.NS", "TECHM.NS", "INDUSINDBK.NS", "ONGC.NS", "HDFCLIFE.NS",
-    "SBILIFE.NS", "DRREDDY.NS", "CIPLA.NS", "APOLLOHOSP.NS", "TATACONSUM.NS",
-    "BRITANNIA.NS", "EICHERMOT.NS", "HEROMOTOCO.NS", "DIVISLAB.NS", "BPCL.NS",
-    "HINDALCO.NS", "BEL.NS", "HAL.NS", "TRENT.NS", "VBL.NS", "BAJAJ-AUTO.NS", "SHRIRAMFIN.NS"
+st.set_page_config(page_title="Quant Barrier & Sentiment Trader", page_icon="📈", layout="wide")
+
+# Expanded Market Tickers (50 US + 50 Indian)
+TOP_50_US = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "BRK-B", "AVGO", "LLY",
+    "JPM", "WMT", "V", "XOM", "UNH", "MA", "ORCL", "PG", "COST", "HD",
+    "JNJ", "BAC", "ABBV", "KO", "MRK", "NFLX", "CVX", "CRM", "AMD", "PEP",
+    "TMSO", "LIN", "TMO", "ACN", "CSCO", "DIS", "MCD", "ABT", "DHR", "INTC",
+    "TXN", "PM", "VZ", "AMGN", "IBM", "PFE", "UNP", "LOW", "SPGI", "HON"
 ]
 
+TOP_50_INDIA = [
+    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "BHARTIARTL.NS", "ITC.NS", "SBIN.NS", "LTIM.NS", "HINDUNILVR.NS",
+    "LT.NS", "HCLTECH.NS", "AXISBANK.NS", "KOTAKBANK.NS", "SUNPHARMA.NS", "M&M.NS", "MARUTI.NS", "NTPC.NS", "ULTRACEMCO.NS", "TITAN.NS",
+    "POWERGRID.NS", "TATASTEEL.NS", "ADANIENT.NS", "BAJFINANCE.NS", "WIPRO.NS", "ASIANPAINT.NS", "ONGC.NS", "COALINDIA.NS", "BAJAJFINSV.NS", "JSWSTEEL.NS",
+    "TATAMOTORS.NS", "ADANIPORTS.NS", "NESTLEIND.NS", "GRASIM.NS", "TECHM.NS", "SBILIFE.NS", "DRREDDY.NS", "EICHERMOT.NS", "CIPLA.NS", "HDFCLIFE.NS",
+    "BRITANNIA.NS", "BPCL.NS", "HINDALCO.NS", "TATACONSUM.NS", "INDUSINDBK.NS", "DIVISLAB.NS", "HEROMOTOCO.NS", "APOLLOHOSP.NS", "BAJAJ-AUTO.NS", "BEL.NS"
+]
+
+DEFAULT_TICKERS = TOP_50_US[:5] + TOP_50_INDIA[:5]
+
 DEFAULT_SECURITY_IDS = {
-    "RELIANCE.NS": "2885", "TCS.NS": "11536", "INFY.NS": "1594", "HDFCBANK.NS": "1333", "ICICIBANK.NS": "4963",
-    "BHARTIARTL.NS": "10604", "SBIN.NS": "3045", "ITC.NS": "1660", "HINDUNILVR.NS": "1394", "LT.NS": "11483"
+    "RELIANCE.NS": "2885", "TCS.NS": "11536", "INFY.NS": "1594", 
+    "HDFCBANK.NS": "1333", "ICICIBANK.NS": "4963"
 }
 
 FEATURES = [
     "log_return", "rsi_14", "macd_hist_norm", "atr_ratio", 
-    "stoch_k", "stoch_d", "bb_width", "bb_percent_b", "vroc", "sma_spread_ratio"
+    "stoch_k", "stoch_d", "bb_width", "bb_percent_b", "vroc", 
+    "sma_spread_ratio", "news_sentiment"
 ]
 
 
 def secret(name: str, default: Any = None) -> Any:
+    """Read a Streamlit secret or environment variable."""
     try:
         return st.secrets.get(name, os.getenv(name, default))
     except Exception:
@@ -86,27 +82,61 @@ def security_ids() -> dict[str, str]:
     return {**DEFAULT_SECURITY_IDS, **dict(configured or {})}
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_ticker_news(ticker: str) -> list[dict[str, str]]:
+    """Fetch live Google News RSS feed for given ticker."""
+    query_ticker = ticker.replace(".NS", "")
+    rss_url = f"https://news.google.com/rss/search?q={query_ticker}+stock+when:7d&hl=en-US&gl=US&ceid=US:en"
+    feed = feedparser.parse(rss_url)
+    news_items = []
+    
+    POSITIVE_WORDS = {"up", "gain", "bull", "surge", "growth", "profit", "buy", "high", "beat", "positive", "record"}
+    NEGATIVE_WORDS = {"down", "loss", "bear", "drop", "fall", "slump", "sell", "low", "miss", "negative", "warn"}
+
+    for entry in feed.entries[:8]:
+        title = entry.get("title", "")
+        summary = entry.get("summary", "")
+        published = entry.get("published", "")
+        
+        # Primitive sentiment analysis (lexicon based)
+        words = set(title.lower().split() + summary.lower().split())
+        pos_score = len(words.intersection(POSITIVE_WORDS))
+        neg_score = len(words.intersection(NEGATIVE_WORDS))
+        
+        score = 0.0
+        if pos_score + neg_score > 0:
+            score = (pos_score - neg_score) / (pos_score + neg_score)
+            
+        news_items.append({
+            "title": title,
+            "link": entry.get("link", "#"),
+            "published": published,
+            "score": score
+        })
+    return news_items
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def load_history(ticker: str) -> pd.DataFrame:
     data = yf.download(ticker, period="5y", interval="1d", auto_adjust=True, progress=False, threads=False)
     if data.empty:
-        raise ValueError(f"No market data retrieved for {ticker}.")
+        raise ValueError(f"Yahoo Finance returned no daily data for {ticker}.")
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
     return data.rename(columns=str.title).dropna(subset=["Open", "High", "Low", "Close", "Volume"])
 
 
-def feature_frame(raw: pd.DataFrame) -> pd.DataFrame:
+def feature_frame(raw: pd.DataFrame, news_sentiment_score: float = 0.0) -> pd.DataFrame:
+    """Stationary inputs only; absolute price levels never enter model."""
     df = raw.copy()
     close, high, low, volume = df["Close"], df["High"], df["Low"], df["Volume"]
-
     atr = AverageTrueRange(high, low, close, window=14).average_true_range()
     macd = MACD(close, window_slow=26, window_fast=12, window_sign=9).macd_diff()
     stoch = StochasticOscillator(high, low, close, window=14, smooth_window=3)
     bb = BollingerBands(close, window=20, window_dev=2)
     sma10 = SMAIndicator(close, window=10).sma_indicator()
     sma50 = SMAIndicator(close, window=50).sma_indicator()
-
+    
     result = pd.DataFrame(index=df.index)
     result["log_return"] = np.log(close / close.shift(1))
     result["rsi_14"] = RSIIndicator(close, window=14).rsi() / 100.0
@@ -118,7 +148,9 @@ def feature_frame(raw: pd.DataFrame) -> pd.DataFrame:
     result["bb_percent_b"] = bb.bollinger_pband()
     result["vroc"] = volume.pct_change(10).replace([np.inf, -np.inf], np.nan)
     result["sma_spread_ratio"] = (sma10 / sma50.replace(0, np.nan)) - 1.0
-
+    
+    # News sentiment features
+    result["news_sentiment"] = news_sentiment_score
     result["atr"] = atr
     result["close"] = close
     return result.replace([np.inf, -np.inf], np.nan)
@@ -130,10 +162,8 @@ def triple_barrier_labels(frame: pd.DataFrame, horizon: int = 5) -> pd.Series:
         entry, atr = frame["close"].iloc[i], frame["atr"].iloc[i]
         if not np.isfinite(entry) or not np.isfinite(atr) or atr <= 0:
             continue
-
-        upper, lower = entry + (1.5 * atr), entry - (1.0 * atr)
+        upper, lower = entry + 1.5 * atr, entry - 1.0 * atr
         future = frame.iloc[i + 1 : i + horizon + 1]
-
         for _, candle in future.iterrows():
             if candle["High"] >= upper and candle["Low"] <= lower:
                 labels.iloc[i] = 0
@@ -149,8 +179,8 @@ def triple_barrier_labels(frame: pd.DataFrame, horizon: int = 5) -> pd.Series:
     return labels
 
 
-def make_dataset(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
-    engineered = feature_frame(raw)
+def make_dataset(raw: pd.DataFrame, news_score: float) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+    engineered = feature_frame(raw, news_sentiment_score=news_score)
     engineered[["High", "Low"]] = raw[["High", "Low"]]
     engineered["target"] = triple_barrier_labels(engineered)
     clean = engineered.dropna(subset=FEATURES + ["target"])
@@ -159,78 +189,64 @@ def make_dataset(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.DataFra
 
 def build_model(scale_pos_weight: float) -> XGBClassifier:
     return XGBClassifier(
-        objective="binary:logistic",
-        eval_metric="logloss",
-        learning_rate=0.02,
-        max_depth=4,
-        n_estimators=300,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=scale_pos_weight,
-        random_state=42,
-        n_jobs=-1,
-        tree_method="hist",
+        objective="binary:logistic", eval_metric="logloss", learning_rate=0.02, max_depth=4,
+        n_estimators=300, subsample=0.8, colsample_bytree=0.8, scale_pos_weight=scale_pos_weight,
+        random_state=42, n_jobs=1, tree_method="hist",
     )
 
 
 def train_model(ticker: str) -> dict[str, Any]:
     raw = load_history(ticker)
-    X, y, engineered = make_dataset(raw)
-
+    news = fetch_ticker_news(ticker)
+    news_score = np.mean([item["score"] for item in news]) if news else 0.0
+    
+    X, y, engineered = make_dataset(raw, news_score)
     if len(X) < 160 or y.nunique() < 2:
-        raise ValueError(f"Insufficient history or unbalanced classes for {ticker}.")
-
+        raise ValueError(f"Insufficient balanced labeled history for {ticker}.")
+        
     split_at = int(len(X) * 0.80)
-    X_train, X_test = X.iloc[:split_at], X.iloc[split_at:]
-    y_train, y_test = y.iloc[:split_at], y.iloc[split_at:]
-
+    X_train, X_test, y_train, y_test = X.iloc[:split_at], X.iloc[split_at:], y.iloc[:split_at], y.iloc[split_at:]
+    
     if y_train.nunique() < 2 or y_test.nunique() < 2:
-        raise ValueError(f"Unbalanced dataset splits for {ticker}.")
-
+        raise ValueError(f"Time-ordered holdout for {ticker} has only one class.")
+        
     class_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
     folds = TimeSeriesSplit(n_splits=4)
     cv_f1 = []
-
+    
     for train_idx, val_idx in folds.split(X_train):
-        fold_weight = (y_train.iloc[train_idx] == 0).sum() / max((y_train.iloc[train_idx] == 1).sum(), 1)
-        fold = build_model(fold_weight)
+        fold = build_model((y_train.iloc[train_idx] == 0).sum() / max((y_train.iloc[train_idx] == 1).sum(), 1))
         fold.fit(X_train.iloc[train_idx], y_train.iloc[train_idx])
-        preds = (fold.predict_proba(X_train.iloc[val_idx])[:, 1] >= 0.5).astype(int)
-        cv_f1.append(f1_score(y_train.iloc[val_idx], preds, zero_division=0))
-
+        cv_f1.append(f1_score(y_train.iloc[val_idx], (fold.predict_proba(X_train.iloc[val_idx])[:, 1] >= 0.5).astype(int), zero_division=0))
+        
     model = build_model(class_weight)
     model.fit(X_train, y_train)
-
     probability = model.predict_proba(X_test)[:, 1]
     prediction = (probability >= 0.5).astype(int)
-
+    
     metrics = {
-        "precision": precision_score(y_test, prediction, zero_division=0),
+        "precision": precision_score(y_test, prediction, zero_division=0), 
         "recall": recall_score(y_test, prediction, zero_division=0),
-        "f1": f1_score(y_test, prediction, zero_division=0),
+        "f1": f1_score(y_test, prediction, zero_division=0), 
         "roc_auc": roc_auc_score(y_test, probability),
-        "accuracy": accuracy_score(y_test, prediction),
-        "cv_f1": float(np.mean(cv_f1)),
+        "accuracy": accuracy_score(y_test, prediction), 
+        "cv_f1": float(np.mean(cv_f1)), 
         "observations": len(X),
     }
-
     latest = engineered.dropna(subset=FEATURES).iloc[-1]
     return {
-        "model": model,
-        "metrics": metrics,
-        "latest_features": latest[FEATURES].to_frame().T,
-        "last_price": float(latest["close"]),
-        "atr": float(latest["atr"]),
-        "trained_at": datetime.now().isoformat(),
+        "model": model, "metrics": metrics, "latest_features": latest[FEATURES].to_frame().T,
+        "last_price": float(latest["close"]), "atr": float(latest["atr"]), 
+        "news": news, "news_score": news_score, "trained_at": datetime.now().isoformat()
     }
 
 
 def dhan_client() -> Any:
     client_id, token = secret("DHAN_CLIENT_ID"), secret("DHAN_ACCESS_TOKEN")
     if not client_id or not token:
-        raise RuntimeError("Missing Dhan API credentials in Streamlit secrets.")
+        raise RuntimeError("DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN must be configured.")
     if DhanContext is None:
-        raise RuntimeError("dhanhq package not found.")
+        raise RuntimeError("dhanhq package not installed.")
     return dhanhq(DhanContext(str(client_id), str(token)))
 
 
@@ -244,65 +260,41 @@ def funds_and_positions() -> tuple[dict[str, Any], list[dict[str, Any]]]:
         return {}, []
 
 
-def fetch_stock_news(ticker: str) -> list[dict[str, str]]:
-    """Fetches real-time stock market news using RSS feed endpoints."""
-    clean_ticker = ticker.replace(".NS", "")
-    feed_url = f"https://news.google.com/rss/search?q={clean_ticker}+stock+NSE+India&hl=en-IN&gl=IN&ceid=IN:en"
-    feed = feedparser.parse(feed_url)
-    articles = []
-    for entry in feed.entries[:5]:
-        articles.append({"title": entry.title, "link": entry.link, "published": entry.get("published", "")})
-    return articles
+def position_size(capital: float, price: float, risk_pct: float, stop_pct: float, cap_pct: float) -> int:
+    risk_amount = capital * risk_pct
+    stop_distance = price * stop_pct
+    risk_quantity = math.floor(risk_amount / stop_distance) if stop_distance > 0 else 0
+    capital_quantity = math.floor((capital * cap_pct) / price) if price > 0 else 0
+    return max(0, min(risk_quantity, capital_quantity))
 
 
-def execute_cmd(cmd_text: str) -> None:
-    parts = cmd_text.strip().split()
-    if not parts:
-        return
-    command = parts[0].lower()
-
-    if command == "/start":
-        st.session_state.bot_state = "RUNNING"
-        add_log("CMD EXEC: /start -> Trading feed active.")
-    elif command == "/stop":
-        st.session_state.bot_state = "STOPPED"
-        add_log("CMD EXEC: /stop -> Trading feed suspended.")
-    elif command == "/risk":
-        if len(parts) > 1:
-            try:
-                val = float(parts[1]) / 100.0
-                st.session_state.cmd_risk_pct = max(0.005, min(0.05, val))
-                add_log(f"CMD EXEC: /risk -> Risk ratio set to {st.session_state.cmd_risk_pct * 100:.1f}%")
-            except ValueError:
-                add_log("CMD ERROR: Usage -> /risk [value] (e.g. /risk 1.5)")
-        else:
-            add_log(f"CMD READ: Current Risk setting = {st.session_state.get('cmd_risk_pct', 0.01) * 100:.1f}%")
-    elif command == "/stocks":
-        _, positions = funds_and_positions()
-        active = [p for p in positions if abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0)) > 0]
-        if not active:
-            add_log("CMD READ: /stocks -> No open active positions.")
-        else:
-            add_log("--- CURRENT BOUGHT POSITIONS ---")
-            for p in active:
-                sym = p.get("tradingSymbol", p.get("securityId", "Stock"))
-                qty = p.get("netQty", p.get("netQuantity", 0))
-                price = p.get("costPrice", 0)
-                add_log(f"Holdings: {sym} | Qty: {qty} | Entry Price: ₹{float(price):,.2f}")
-    else:
-        add_log(f"CMD UNKNOWN: Command '{command}' not recognized. Options: /start, /stop, /risk [val], /stocks")
+def run_cycle(tickers: list[str], threshold: float, risk_pct: float, stop_pct: float, target_pct: float, cap_pct: float) -> dict[str, float]:
+    funds, positions = funds_and_positions()
+    capital = float(funds.get("availabelBalance", 100000) or 100000) # Default fallback paper capital
+    probabilities: dict[str, float] = {}
+    
+    for ticker in tickers:
+        try:
+            artifact = st.session_state.models.get(ticker) or train_model(ticker)
+            st.session_state.models[ticker] = artifact
+            prob = float(artifact["model"].predict_proba(artifact["latest_features"])[0, 1])
+            probabilities[ticker] = prob
+            quantity = position_size(capital, artifact["last_price"], risk_pct, stop_pct, cap_pct)
+            add_log(f"{ticker}: P(Barrier)={prob:.1%} | News Score={artifact['news_score']:.2f} | Price=${artifact['last_price']:,.2f}")
+        except Exception as exc:
+            add_log(f"{ticker}: Execution Error: {exc}")
+    return probabilities
 
 
 def login() -> bool:
     required = secret("APP_PASSWORD")
     if not required:
-        st.error("Set APP_PASSWORD in Streamlit secrets.")
+        st.error("APP_PASSWORD must be set in Streamlit secrets before application can be unlocked.")
         return False
     if st.session_state.get("authenticated"):
         return True
-
-    st.title("🔐 Quant Barrier Trader")
-    supplied = st.text_input("Password", type="password")
+    st.title("🔐 Quant Barrier & Sentiment Dashboard")
+    supplied = st.text_input("Application password", type="password")
     if st.button("Unlock", type="primary"):
         if hashlib.sha256(supplied.encode()).digest() == hashlib.sha256(str(required).encode()).digest():
             st.session_state.authenticated = True
@@ -311,145 +303,135 @@ def login() -> bool:
     return False
 
 
+def execute_cmd(command: str) -> str:
+    """Evaluates Python/Terminal commands inside session scope."""
+    buffer = io.StringIO()
+    sys.stdout = buffer
+    try:
+        if command.startswith("!"):
+            # Shell pass-through command
+            import subprocess
+            res = subprocess.run(command[1:], shell=True, capture_output=True, text=True)
+            return res.stdout + res.stderr
+        else:
+            # Python expression or block evaluation
+            exec_globals = {
+                "st": st, "pd": pd, "np": np, "yf": yf,
+                "models": st.session_state.get("models", {}),
+                "logs": st.session_state.get("logs", []),
+                "run_cycle": run_cycle
+            }
+            exec(command, exec_globals)
+            return buffer.getvalue() or "Command executed successfully."
+    except Exception as e:
+        return f"Error executing command: {e}"
+    finally:
+        sys.stdout = sys.__stdout__
+
+
 def main() -> None:
     if not login():
         return
-
+        
     st.session_state.setdefault("models", {})
     st.session_state.setdefault("logs", [])
     st.session_state.setdefault("last_probabilities", {})
-    st.session_state.setdefault("bot_state", "STOPPED")
-    st.session_state.setdefault("cmd_risk_pct", 0.01)
+    st.session_state.setdefault("cmd_history", [])
 
-    st.title("📈 AI-Powered NSE Quant Trading Platform")
-
-    # --- TOP METRICS OVERVIEW ---
-    funds, positions = funds_and_positions()
-    balance = float(funds.get("availabelBalance", 0) or 0)
-    risk_exposed = sum(abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0)) * float(p.get("costPrice", 0) or 0) for p in positions)
-    active_count = sum(abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0)) > 0 for p in positions)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Available Balance", f"₹{balance:,.2f}")
-    c2.metric("Capital Exposed", f"₹{risk_exposed:,.2f}")
-    c3.metric("Open Positions", int(active_count))
-    c4.metric("Engine Status", st.session_state.bot_state)
-
-    st.divider()
-
-    # --- MAIN NAVIGATION TABS ---
-    tab_console, tab_portfolio, tab_models = st.tabs(["💻 Execution & CLI Console", "📊 Portfolio & Insights", "🤖 Model Validation"])
-
-    # -------------------------------------------------------------
-    # TAB 1: COMMAND LINE CONSOLE & SIGNALS
-    # -------------------------------------------------------------
-    with tab_console:
-        st.subheader("Interactive CLI Terminal Controls")
+    st.title("📈 Quant Barrier & News-Assisted Trader")
+    
+    with st.sidebar:
+        st.header("Execution Controls")
+        live_bot = st.toggle("Live Bot Scan", value=False)
+        threshold = st.slider("Model confidence threshold", 0.50, 0.90, 0.65, 0.01, format="%.0f%%")
+        risk_pct = st.slider("Risk per trade", 0.005, 0.03, 0.01, 0.005, format="%.1f%%")
+        stop_pct = st.slider("Stop-loss", 0.003, 0.05, 0.01, 0.001, format="%.1f%%")
+        target_pct = st.slider("Take-profit", 0.005, 0.10, 0.015, 0.001, format="%.1f%%")
+        cap_pct = st.slider("Max capital per stock", 0.05, 0.40, 0.20, 0.01, format="%.0f%%")
         
-        # CMD Line Input
-        cmd_input = st.text_input("Command Line Terminal", placeholder="Enter command (/start, /stop, /risk 1.5, /stocks)...", key="cli_input")
-        if cmd_input:
-            execute_cmd(cmd_input)
-            st.session_state.cli_input = ""
-
-        # Console Log Stream
-        st.code("\n".join(st.session_state.logs) or "Terminal ready. Enter command above.", language="bash")
-
-        st.divider()
-        st.subheader("Market Scan Probabilities")
-        
-        is_active = st.session_state.bot_state == "RUNNING"
-        
-        @st.fragment(run_every=60 if is_active else None)
-        def signal_panel() -> None:
-            probabilities = st.session_state.last_probabilities
-            if not probabilities:
-                st.info("Run scan to view real-time predictions.")
-            else:
-                for ticker in DEFAULT_TICKERS[:10]:
-                    p = probabilities.get(ticker)
-                    if p is not None:
-                        c_sym, c_bar = st.columns([1, 4])
-                        c_sym.write(f"**{ticker}**")
-                        c_bar.progress(p, text=f"Hit Probability: {p * 100:.1f}%")
-
-        signal_panel()
-
-    # -------------------------------------------------------------
-    # TAB 2: PORTFOLIO, BAR GRAPHS, PREDICTIONS & NEWS
-    # -------------------------------------------------------------
-    with tab_portfolio:
-        st.subheader("Portfolio Performance & Stock Analytics")
-
-        active_positions = [p for p in positions if abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0)) > 0]
-        
-        if active_positions:
-            portfolio_data = []
-            for p in active_positions:
-                ticker_name = p.get("tradingSymbol", p.get("securityId", "Stock"))
-                qty = abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0))
-                buy_price = float(p.get("costPrice", 0) or 0)
-                tot_val = qty * buy_price
-                
-                # Fetch ML Prediction if trained
-                pred_prob = "N/A"
-                if ticker_name in st.session_state.models:
-                    pred_prob = f"{st.session_state.models[ticker_name]['metrics']['f1'] * 100:.1f}%"
-
-                portfolio_data.append({
-                    "Stock": ticker_name,
-                    "Quantity": qty,
-                    "Buy Price (₹)": buy_price,
-                    "Total Value (₹)": tot_val,
-                    "Model Confidence": pred_prob
-                })
-            
-            df_port = pd.DataFrame(portfolio_data)
-
-            # BAR GRAPH: Stock vs Total Value / Quantity Bought
-            fig = px.bar(
-                df_port, 
-                x="Stock", 
-                y="Total Value (₹)", 
-                color="Quantity", 
-                title="Bought Stocks: Volume & Total Valuation Overview",
-                text_auto=".2s"
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            # HOLDINGS TABLE
-            st.markdown("### Purchased Positions Detail")
-            st.dataframe(df_port, use_container_width=True)
-
+        market_choice = st.radio("Select Universe Quick-List:", ["Default Mixed", "Top 50 US", "Top 50 India"])
+        if market_choice == "Top 50 US":
+            active_defaults = TOP_50_US
+        elif market_choice == "Top 50 India":
+            active_defaults = TOP_50_INDIA
         else:
-            st.info("No active bought stock positions detected in connected Dhan trading account.")
+            active_defaults = DEFAULT_TICKERS
 
-        st.divider()
-        st.subheader("📰 Live Stock News Feed")
+        tickers = st.multiselect("Target Tickers", active_defaults + TOP_50_US + TOP_50_INDIA, default=active_defaults[:5])
         
-        selected_stock = st.selectbox("Select Stock for News & Analytics", DEFAULT_TICKERS)
-        if selected_stock:
-            news_items = fetch_stock_news(selected_stock)
-            if news_items:
-                for item in news_items:
-                    st.markdown(f"**[{item['title']}]({item['link']})**")
-                    st.caption(f"Published: {item['published']}")
-            else:
-                st.write("No active news articles retrieved.")
+        if st.button("Retrain AI Models"):
+            st.session_state.models = {}
+            load_history.clear()
+            fetch_ticker_news.clear()
+            add_log("Models & news cache reset; retraining initiated.")
 
-    # -------------------------------------------------------------
-    # TAB 3: MODEL VALIDATION METRICS
-    # -------------------------------------------------------------
-    with tab_models:
-        st.subheader("XGBoost Predictive Metrics")
+    # High-level Metrics Cards
+    precision_values = [v["metrics"]["precision"] for v in st.session_state.models.values()]
+    cards = st.columns(4)
+    cards[0].metric("Monitored Tickers", len(tickers))
+    cards[1].metric("Active Trained Models", len(st.session_state.models))
+    cards[2].metric("Average Precision", f"{np.mean(precision_values):.1%}" if precision_values else "—")
+    cards[3].metric("Engine Status", "Active" if live_bot else "Standby")
+
+    # Main Tabs Area
+    tab_dashboard, tab_news, tab_console = st.tabs(["📊 Prediction Signals", "📰 Live News & Sentiment", "💻 Interactive Console"])
+
+    with tab_dashboard:
+        if st.button("Scan Tickers Now", type="primary") or live_bot:
+            probs = run_cycle(tickers, threshold, risk_pct, stop_pct, target_pct, cap_pct)
+            if probs:
+                st.session_state.last_probabilities = probs
+        
+        probabilities = st.session_state.last_probabilities
+        if not probabilities:
+            st.info("Run a scan to calculate barrier-hit predictions and sentiment integration.")
+        else:
+            for ticker in tickers:
+                p = probabilities.get(ticker)
+                if p is not None:
+                    st.write(f"**{ticker}** — Prediction Confidence: **{p:.1%}**")
+                    st.progress(p)
+
+        st.subheader("Model Validation Metrics")
         if st.session_state.models:
             report = pd.DataFrame({ticker: data["metrics"] for ticker, data in st.session_state.models.items()}).T
-            st.dataframe(
-                report.style.format("{:.1%}", subset=["precision", "recall", "f1", "roc_auc", "accuracy", "cv_f1"]),
-                use_container_width=True,
-            )
-        else:
-            st.info("No trained models found. Models will train when the CLI engine runs scan operations.")
+            st.dataframe(report.style.format("{:.2%}", subset=["precision", "recall", "f1", "roc_auc", "accuracy", "cv_f1"]), use_container_width=True)
+
+    with tab_news:
+        st.subheader("Live Financial Feed & Predictions Sentiment Analysis")
+        selected_news_ticker = st.selectbox("View news for ticker:", tickers)
+        if selected_news_ticker:
+            news_items = fetch_ticker_news(selected_news_ticker)
+            if news_items:
+                avg_score = np.mean([item["score"] for item in news_items])
+                st.write(f"**Aggregated Sentiment Score:** `{avg_score:.2f}` (-1.0 Negative to +1.0 Positive)")
+                for item in news_items:
+                    col1, col2 = st.columns([4, 1])
+                    with col1:
+                        st.markdown(f"[{item['title']}]({item['link']})")
+                        st.caption(f"Published: {item['published']}")
+                    with col2:
+                        st.write(f"Sentiment: `{item['score']:.2f}`")
+                    st.divider()
+            else:
+                st.info("No current news items found for this ticker.")
+
+    with tab_console:
+        st.subheader("Interactive Command Console")
+        st.caption("Enter Python expressions or `!shell_command` (e.g., `print(models.keys())` or `!pip list`).")
+        
+        cmd_input = st.text_input("Terminal Command Input", key="cmd_input")
+        if st.button("Execute", type="primary") and cmd_input:
+            out = execute_cmd(cmd_input)
+            st.session_state.cmd_history.append((cmd_input, out))
+        
+        if st.session_state.cmd_history:
+            st.write("### Output Logs")
+            for cmd, out in reversed(st.session_state.cmd_history):
+                st.code(f"> {cmd}\n{out}", language="bash")
+                
+    st.subheader("Live Execution Console")
+    st.code("\n".join(st.session_state.logs) or "No execution events yet.", language="text")
 
 
 if __name__ == "__main__":
