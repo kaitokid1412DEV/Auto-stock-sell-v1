@@ -248,7 +248,7 @@ def run_cycle(tickers: list[str], threshold: float, risk_pct: float, stop_pct: f
 def login() -> bool:
     required = secret("Harsha@2012")
     if not required:
-        st.error("APP_PASSWORD must be set in Streamlit secrets before this application can be unlocked.")
+        st.error("APP_PASSWORD should/must be set in Streamlit secrets before this application can be unlocked.")
         return False
     if st.session_state.get("authenticated"):
         return True
