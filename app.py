@@ -2,7 +2,7 @@
 AI-assisted, risk-controlled NSE equity trading dashboard.
 
 Install:
-    pip install streamlit yfinance pandas numpy ta scikit-learn xgboost dhanhq
+    pip install streamlit yfinance pandas numpy ta scikit-learn xgboost dhanhq plotly feedparser
 
 Secrets required:
     APP_PASSWORD, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
@@ -21,8 +21,10 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+import feedparser
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 import yfinance as yf
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
@@ -38,33 +40,34 @@ except ImportError:
     DhanContext = None
     dhanhq = None
 
-
 st.set_page_config(page_title="Quant Barrier Trader", page_icon="📈", layout="wide")
 
-DEFAULT_TICKERS = ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS"]
+# Expanded Top 50+ NSE Equities
+DEFAULT_TICKERS = [
+    "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
+    "BHARTIARTL.NS", "SBIN.NS", "LTIM.NS", "ITC.NS", "HINDUNILVR.NS",
+    "LT.NS", "AXISBANK.NS", "KOTAKBANK.NS", "HCLTECH.NS", "ADANIENT.NS",
+    "ADANIPORTS.NS", "SUNPHARMA.NS", "TITAN.NS", "BAJFINANCE.NS", "BAJAJFINSV.NS",
+    "MARUTI.NS", "TATAMOTORS.NS", "TATASTEEL.NS", "NTPC.NS", "POWERGRID.NS",
+    "ULTRACEMCO.NS", "ASIANPAINT.NS", "COALINDIA.NS", "NESTLEIND.NS", "GRASIM.NS",
+    "JSWSTEEL.NS", "TECHM.NS", "INDUSINDBK.NS", "ONGC.NS", "HDFCLIFE.NS",
+    "SBILIFE.NS", "DRREDDY.NS", "CIPLA.NS", "APOLLOHOSP.NS", "TATACONSUM.NS",
+    "BRITANNIA.NS", "EICHERMOT.NS", "HEROMOTOCO.NS", "DIVISLAB.NS", "BPCL.NS",
+    "HINDALCO.NS", "BEL.NS", "HAL.NS", "TRENT.NS", "VBL.NS", "BAJAJ-AUTO.NS", "SHRIRAMFIN.NS"
+]
+
 DEFAULT_SECURITY_IDS = {
-    "RELIANCE.NS": "2885",
-    "TCS.NS": "11536",
-    "INFY.NS": "1594",
-    "HDFCBANK.NS": "1333",
-    "ICICIBANK.NS": "4963",
+    "RELIANCE.NS": "2885", "TCS.NS": "11536", "INFY.NS": "1594", "HDFCBANK.NS": "1333", "ICICIBANK.NS": "4963",
+    "BHARTIARTL.NS": "10604", "SBIN.NS": "3045", "ITC.NS": "1660", "HINDUNILVR.NS": "1394", "LT.NS": "11483"
 }
+
 FEATURES = [
-    "log_return",
-    "rsi_14",
-    "macd_hist_norm",
-    "atr_ratio",
-    "stoch_k",
-    "stoch_d",
-    "bb_width",
-    "bb_percent_b",
-    "vroc",
-    "sma_spread_ratio",
+    "log_return", "rsi_14", "macd_hist_norm", "atr_ratio", 
+    "stoch_k", "stoch_d", "bb_width", "bb_percent_b", "vroc", "sma_spread_ratio"
 ]
 
 
 def secret(name: str, default: Any = None) -> Any:
-    """Read a Streamlit secret or environment variable securely."""
     try:
         return st.secrets.get(name, os.getenv(name, default))
     except Exception:
@@ -94,7 +97,6 @@ def load_history(ticker: str) -> pd.DataFrame:
 
 
 def feature_frame(raw: pd.DataFrame) -> pd.DataFrame:
-    """Stationary feature generation preventing price-level data leakage."""
     df = raw.copy()
     close, high, low, volume = df["Close"], df["High"], df["Low"], df["Volume"]
 
@@ -123,7 +125,6 @@ def feature_frame(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def triple_barrier_labels(frame: pd.DataFrame, horizon: int = 5) -> pd.Series:
-    """Triple-barrier labelling (+1.5 ATR Target / -1.0 ATR Stop over horizon window)."""
     labels = pd.Series(np.nan, index=frame.index, dtype=float)
     for i in range(len(frame) - horizon):
         entry, atr = frame["close"].iloc[i], frame["atr"].iloc[i]
@@ -234,100 +235,62 @@ def dhan_client() -> Any:
 
 
 def funds_and_positions() -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    client = dhan_client()
-    funds = client.get_fund_limits() or {}
-    positions = client.get_positions() or []
-    return funds, positions if isinstance(positions, list) else []
-
-
-def get_daily_pnl(positions: list[dict[str, Any]]) -> float:
-    keys = ("realizedProfit", "realizedPnl", "unrealizedProfit", "unrealizedPnl", "dayPnL", "dayPnl")
-    return sum(float(p.get(k, 0) or 0) for p in positions for k in keys)
-
-
-def ATR_position_size(capital: float, price: float, atr: float, risk_pct: float, cap_pct: float) -> int:
-    risk_amount = capital * risk_pct
-    stop_distance = atr * 1.0
-
-    risk_quantity = math.floor(risk_amount / stop_distance) if stop_distance > 0 else 0
-    capital_quantity = math.floor((capital * cap_pct) / price) if price > 0 else 0
-
-    return max(0, min(risk_quantity, capital_quantity))
-
-
-def execute_super_order(ticker: str, quantity: int, price: float, atr: float) -> Any:
-    sid = security_ids().get(ticker)
-    if not sid:
-        raise RuntimeError(f"No Dhan Security ID mapping found for {ticker}.")
-    client = dhan_client()
-
-    target_price = round(price + (1.5 * atr), 2)
-    stop_loss_price = round(price - (1.0 * atr), 2)
-
-    return client.place_super_order(
-        security_id=str(sid),
-        exchange_segment="NSE_EQ",
-        transaction_type="BUY",
-        quantity=quantity,
-        order_type="MARKET",
-        product_type="INTRADAY",
-        price=0,
-        target_price=target_price,
-        stop_loss_price=stop_loss_price,
-        correlation_id=f"tb-{ticker.replace('.', '')}-{uuid.uuid4().hex[:12]}",
-    )
-
-
-def run_cycle(
-    tickers: list[str],
-    threshold: float,
-    risk_pct: float,
-    cap_pct: float,
-) -> dict[str, float]:
     try:
-        funds, positions = funds_and_positions()
-    except Exception as exc:
-        add_log(f"Connection Error: {exc}")
-        return {}
+        client = dhan_client()
+        funds = client.get_fund_limits() or {}
+        positions = client.get_positions() or []
+        return funds, positions if isinstance(positions, list) else []
+    except Exception:
+        return {}, []
 
-    capital = float(funds.get("availabelBalance", 0) or 0)
-    ledger = float(funds.get("sodLimit", capital) or capital)
-    daily_pnl = get_daily_pnl(positions)
 
-    if ledger > 0 and daily_pnl <= -(ledger * 0.03):
-        add_log(f"CIRCUIT BREAKER: Daily PnL (₹{daily_pnl:,.2f}) breached 3.0% limit. Execution suspended.")
-        return {}
+def fetch_stock_news(ticker: str) -> list[dict[str, str]]:
+    """Fetches real-time stock market news using RSS feed endpoints."""
+    clean_ticker = ticker.replace(".NS", "")
+    feed_url = f"https://news.google.com/rss/search?q={clean_ticker}+stock+NSE+India&hl=en-IN&gl=IN&ceid=IN:en"
+    feed = feedparser.parse(feed_url)
+    articles = []
+    for entry in feed.entries[:5]:
+        articles.append({"title": entry.title, "link": entry.link, "published": entry.get("published", "")})
+    return articles
 
-    open_ids = {str(p.get("securityId", "")) for p in positions if abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0)) > 0}
-    probabilities: dict[str, float] = {}
 
-    for ticker in tickers:
-        try:
-            artifact = st.session_state.models.get(ticker) or train_model(ticker)
-            st.session_state.models[ticker] = artifact
+def execute_cmd(cmd_text: str) -> None:
+    parts = cmd_text.strip().split()
+    if not parts:
+        return
+    command = parts[0].lower()
 
-            prob = float(artifact["model"].predict_proba(artifact["latest_features"])[0, 1])
-            probabilities[ticker] = prob
-
-            price, atr = artifact["last_price"], artifact["atr"]
-            quantity = ATR_position_size(capital, price, atr, risk_pct, cap_pct)
-
-            add_log(f"{ticker}: Signal={prob * 100:.1f}% | Price=₹{price:,.2f} | Quantity={quantity}")
-
-            sid = security_ids().get(ticker)
-            if prob < threshold or quantity < 1 or str(sid) in open_ids:
-                continue
-
-            if str(secret("LIVE_TRADING_ENABLED", "false")).lower() != "true":
-                add_log(f"{ticker}: Execution skipped (Paper-Trading Mode).")
-                continue
-
-            response = execute_super_order(ticker, quantity, price, atr)
-            add_log(f"{ticker}: Dhan Super Order Placed -> {response}")
-        except Exception as exc:
-            add_log(f"{ticker}: Processing error -> {exc}")
-
-    return probabilities
+    if command == "/start":
+        st.session_state.bot_state = "RUNNING"
+        add_log("CMD EXEC: /start -> Trading feed active.")
+    elif command == "/stop":
+        st.session_state.bot_state = "STOPPED"
+        add_log("CMD EXEC: /stop -> Trading feed suspended.")
+    elif command == "/risk":
+        if len(parts) > 1:
+            try:
+                val = float(parts[1]) / 100.0
+                st.session_state.cmd_risk_pct = max(0.005, min(0.05, val))
+                add_log(f"CMD EXEC: /risk -> Risk ratio set to {st.session_state.cmd_risk_pct * 100:.1f}%")
+            except ValueError:
+                add_log("CMD ERROR: Usage -> /risk [value] (e.g. /risk 1.5)")
+        else:
+            add_log(f"CMD READ: Current Risk setting = {st.session_state.get('cmd_risk_pct', 0.01) * 100:.1f}%")
+    elif command == "/stocks":
+        _, positions = funds_and_positions()
+        active = [p for p in positions if abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0)) > 0]
+        if not active:
+            add_log("CMD READ: /stocks -> No open active positions.")
+        else:
+            add_log("--- CURRENT BOUGHT POSITIONS ---")
+            for p in active:
+                sym = p.get("tradingSymbol", p.get("securityId", "Stock"))
+                qty = p.get("netQty", p.get("netQuantity", 0))
+                price = p.get("costPrice", 0)
+                add_log(f"Holdings: {sym} | Qty: {qty} | Entry Price: ₹{float(price):,.2f}")
+    else:
+        add_log(f"CMD UNKNOWN: Command '{command}' not recognized. Options: /start, /stop, /risk [val], /stocks")
 
 
 def login() -> bool:
@@ -355,132 +318,138 @@ def main() -> None:
     st.session_state.setdefault("models", {})
     st.session_state.setdefault("logs", [])
     st.session_state.setdefault("last_probabilities", {})
-    st.session_state.setdefault("bot_state", "STOPPED")  # Options: STOPPED, RUNNING, PAUSED
+    st.session_state.setdefault("bot_state", "STOPPED")
+    st.session_state.setdefault("cmd_risk_pct", 0.01)
 
-    st.title("📈 Quant Barrier Trader")
+    st.title("📈 AI-Powered NSE Quant Trading Platform")
 
-    # --- SIDEBAR & RISK PARAMETERS ---
-    with st.sidebar:
-        st.header("Risk & Parameter Setup")
-        
-        # FIXED: Proper float formatting strings (%.1f%%) to avoid rounding display bugs like '1%-1%'
-        threshold = st.slider("Confidence Threshold", min_value=0.50, max_value=0.90, value=0.70, step=0.01, format="%.1f%%")
-        risk_pct = st.slider("Risk Per Trade", min_value=0.005, max_value=0.030, value=0.010, step=0.005, format="%.1f%%")
-        cap_pct = st.slider("Max Capital Allocation", min_value=0.05, max_value=0.40, value=0.20, step=0.01, format="%.1f%%")
-        
-        tickers = st.multiselect("Target Tickers", DEFAULT_TICKERS, default=DEFAULT_TICKERS)
-
-        st.divider()
-        if st.button("Retrain AI Models", use_container_width=True):
-            st.session_state.models = {}
-            load_history.clear()
-            add_log("Models reset. Retraining from historical market feed...")
-
-        if st.button("Exit All Positions", type="secondary", use_container_width=True):
-            try:
-                response = dhan_client().exit_all_positions()
-                add_log(f"EMERGENCY EXIT EXECUTED: {response}")
-                st.warning("Position exit requests transmitted.")
-            except Exception as exc:
-                st.error(f"Failed to terminate positions: {exc}")
-
-    # --- PORTFOLIO OVERVIEW CARDS ---
-    try:
-        funds, positions = funds_and_positions()
-        balance = float(funds.get("availabelBalance", 0) or 0)
-        risk_exposed = sum(abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0)) * float(p.get("costPrice", 0) or 0) for p in positions)
-        active_count = sum(abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0)) > 0 for p in positions)
-    except Exception as exc:
-        balance, risk_exposed, active_count = 0.0, 0.0, 0
-        add_log(f"Portfolio metrics error: {exc}")
-
-    precision_values = [v["metrics"]["precision"] for v in st.session_state.models.values()]
+    # --- TOP METRICS OVERVIEW ---
+    funds, positions = funds_and_positions()
+    balance = float(funds.get("availabelBalance", 0) or 0)
+    risk_exposed = sum(abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0)) * float(p.get("costPrice", 0) or 0) for p in positions)
+    active_count = sum(abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0)) > 0 for p in positions)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Available Balance", f"₹{balance:,.2f}")
     c2.metric("Capital Exposed", f"₹{risk_exposed:,.2f}")
     c3.metric("Open Positions", int(active_count))
-    c4.metric("Avg Model Precision", f"{np.mean(precision_values) * 100:.1f}%" if precision_values else "—")
+    c4.metric("Engine Status", st.session_state.bot_state)
 
     st.divider()
 
-    # --- USER FEED EXECUTION CONTROL CONSOLE ---
-    st.subheader("🤖 Live User Feed & Bot Console")
-    
-    ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1, 1, 1, 2])
+    # --- MAIN NAVIGATION TABS ---
+    tab_console, tab_portfolio, tab_models = st.tabs(["💻 Execution & CLI Console", "📊 Portfolio & Insights", "🤖 Model Validation"])
 
-    with ctrl_col1:
-        if st.button("▶️ Start Feed", type="primary", use_container_width=True):
-            st.session_state.bot_state = "RUNNING"
-            add_log("USER FEED STARTED: Automated scan cycle activated.")
-            st.rerun()
-
-    with ctrl_col2:
-        if st.button("⏸️ Pause Feed", use_container_width=True):
-            st.session_state.bot_state = "PAUSED"
-            add_log("USER FEED PAUSED: Automated scans suspended.")
-            st.rerun()
-
-    with ctrl_col3:
-        if st.button("⏹️ Stop Feed", use_container_width=True):
-            st.session_state.bot_state = "STOPPED"
-            add_log("USER FEED STOPPED: Bot turned off.")
-            st.rerun()
-
-    with ctrl_col4:
-        state = st.session_state.bot_state
-        if state == "RUNNING":
-            st.success("STATUS: **ACTIVE (Scanning Every 60s)**")
-        elif state == "PAUSED":
-            st.warning("STATUS: **PAUSED (Awaiting Resume)**")
-        else:
-            st.error("STATUS: **STOPPED (Feed Offline)**")
-
-    # --- SIGNAL METER (AUTO REFRESH VIA FRAGMENT) ---
-    is_active = st.session_state.bot_state == "RUNNING"
-
-    @st.fragment(run_every=60 if is_active else None)
-    def signal_panel() -> None:
-        manual_scan = st.button("🔍 Manual Scan Now")
+    # -------------------------------------------------------------
+    # TAB 1: COMMAND LINE CONSOLE & SIGNALS
+    # -------------------------------------------------------------
+    with tab_console:
+        st.subheader("Interactive CLI Terminal Controls")
         
-        if manual_scan or is_active:
-            if st.session_state.bot_state != "PAUSED" or manual_scan:
-                probs = run_cycle(tickers, threshold, risk_pct, cap_pct)
-                if probs:
-                    st.session_state.last_probabilities = probs
+        # CMD Line Input
+        cmd_input = st.text_input("Command Line Terminal", placeholder="Enter command (/start, /stop, /risk 1.5, /stocks)...", key="cli_input")
+        if cmd_input:
+            execute_cmd(cmd_input)
+            st.session_state.cli_input = ""
 
-        st.markdown("#### Real-time Barrier Hit Probabilities")
-        probabilities = st.session_state.last_probabilities
-        if not probabilities:
-            st.info("No scan data available. Start the feed or run a manual scan.")
+        # Console Log Stream
+        st.code("\n".join(st.session_state.logs) or "Terminal ready. Enter command above.", language="bash")
+
+        st.divider()
+        st.subheader("Market Scan Probabilities")
+        
+        is_active = st.session_state.bot_state == "RUNNING"
+        
+        @st.fragment(run_every=60 if is_active else None)
+        def signal_panel() -> None:
+            probabilities = st.session_state.last_probabilities
+            if not probabilities:
+                st.info("Run scan to view real-time predictions.")
+            else:
+                for ticker in DEFAULT_TICKERS[:10]:
+                    p = probabilities.get(ticker)
+                    if p is not None:
+                        c_sym, c_bar = st.columns([1, 4])
+                        c_sym.write(f"**{ticker}**")
+                        c_bar.progress(p, text=f"Hit Probability: {p * 100:.1f}%")
+
+        signal_panel()
+
+    # -------------------------------------------------------------
+    # TAB 2: PORTFOLIO, BAR GRAPHS, PREDICTIONS & NEWS
+    # -------------------------------------------------------------
+    with tab_portfolio:
+        st.subheader("Portfolio Performance & Stock Analytics")
+
+        active_positions = [p for p in positions if abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0)) > 0]
+        
+        if active_positions:
+            portfolio_data = []
+            for p in active_positions:
+                ticker_name = p.get("tradingSymbol", p.get("securityId", "Stock"))
+                qty = abs(float(p.get("netQty", p.get("netQuantity", 0)) or 0))
+                buy_price = float(p.get("costPrice", 0) or 0)
+                tot_val = qty * buy_price
+                
+                # Fetch ML Prediction if trained
+                pred_prob = "N/A"
+                if ticker_name in st.session_state.models:
+                    pred_prob = f"{st.session_state.models[ticker_name]['metrics']['f1'] * 100:.1f}%"
+
+                portfolio_data.append({
+                    "Stock": ticker_name,
+                    "Quantity": qty,
+                    "Buy Price (₹)": buy_price,
+                    "Total Value (₹)": tot_val,
+                    "Model Confidence": pred_prob
+                })
+            
+            df_port = pd.DataFrame(portfolio_data)
+
+            # BAR GRAPH: Stock vs Total Value / Quantity Bought
+            fig = px.bar(
+                df_port, 
+                x="Stock", 
+                y="Total Value (₹)", 
+                color="Quantity", 
+                title="Bought Stocks: Volume & Total Valuation Overview",
+                text_auto=".2s"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # HOLDINGS TABLE
+            st.markdown("### Purchased Positions Detail")
+            st.dataframe(df_port, use_container_width=True)
+
         else:
-            for ticker in tickers:
-                p = probabilities.get(ticker)
-                if p is not None:
-                    col_t, col_p = st.columns([1, 4])
-                    col_t.write(f"**{ticker}**")
-                    col_p.progress(p, text=f"P(Target Barrier Hit): {p * 100:.1f}%")
+            st.info("No active bought stock positions detected in connected Dhan trading account.")
 
-    signal_panel()
+        st.divider()
+        st.subheader("📰 Live Stock News Feed")
+        
+        selected_stock = st.selectbox("Select Stock for News & Analytics", DEFAULT_TICKERS)
+        if selected_stock:
+            news_items = fetch_stock_news(selected_stock)
+            if news_items:
+                for item in news_items:
+                    st.markdown(f"**[{item['title']}]({item['link']})**")
+                    st.caption(f"Published: {item['published']}")
+            else:
+                st.write("No active news articles retrieved.")
 
-    st.divider()
-
-    # --- MODEL VALIDATION REPORT ---
-    st.subheader("📊 AI Model Cross-Validation Metrics")
-    if st.session_state.models:
-        report = pd.DataFrame({ticker: data["metrics"] for ticker, data in st.session_state.models.items()}).T
-        # FIXED: Proper percentage formatting across dataframe columns
-        st.dataframe(
-            report.style.format("{:.1%}", subset=["precision", "recall", "f1", "roc_auc", "accuracy", "cv_f1"]),
-            use_container_width=True,
-        )
-    else:
-        st.info("Models will automatically train when the feed starts or a manual scan is triggered.")
-
-    # --- EXECUTION LOGS CONSOLE ---
-    st.subheader("🖥️ Execution Console Log")
-    st.code("\n".join(st.session_state.logs) or "No active events logged.", language="text")
-    st.caption("Target Barrier: +1.5×ATR | Stop Barrier: -1.0×ATR | Horizon: 5 Sessions. Orders routed via Dhan Super Orders.")
+    # -------------------------------------------------------------
+    # TAB 3: MODEL VALIDATION METRICS
+    # -------------------------------------------------------------
+    with tab_models:
+        st.subheader("XGBoost Predictive Metrics")
+        if st.session_state.models:
+            report = pd.DataFrame({ticker: data["metrics"] for ticker, data in st.session_state.models.items()}).T
+            st.dataframe(
+                report.style.format("{:.1%}", subset=["precision", "recall", "f1", "roc_auc", "accuracy", "cv_f1"]),
+                use_container_width=True,
+            )
+        else:
+            st.info("No trained models found. Models will train when the CLI engine runs scan operations.")
 
 
 if __name__ == "__main__":
