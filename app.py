@@ -1,13 +1,12 @@
 """AI-assisted, risk-controlled NSE equity trading dashboard.
 
 Install: pip install streamlit yfinance pandas numpy ta scikit-learn xgboost dhanhq
-Secrets required: APP_PASSWORD, DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
+Secrets required: DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
 Optional secret: LIVE_TRADING_ENABLED=true (otherwise signals are paper-only).
 Run: streamlit run app.py
 """
 from __future__ import annotations
 
-import hashlib
 import math
 import os
 import uuid
@@ -107,7 +106,6 @@ def triple_barrier_labels(frame: pd.DataFrame, horizon: int = 5) -> pd.Series:
         upper, lower = entry + 1.5 * atr, entry - 1.0 * atr
         future = frame.iloc[i + 1 : i + horizon + 1]
         for _, candle in future.iterrows():
-            # Conservative tie handling: a candle crossing both barriers is non-winning.
             if candle["High"] >= upper and candle["Low"] <= lower:
                 labels.iloc[i] = 0
                 break
@@ -148,7 +146,6 @@ def train_model(ticker: str) -> dict[str, Any]:
     if y_train.nunique() < 2 or y_test.nunique() < 2:
         raise ValueError(f"Time-ordered holdout for {ticker} has only one class; cannot calculate reliable metrics.")
     class_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
-    # TimeSeriesSplit is deliberately evaluated on training history only; no shuffled folds.
     folds = TimeSeriesSplit(n_splits=4)
     cv_f1 = []
     for train_idx, val_idx in folds.split(X_train):
@@ -245,26 +242,7 @@ def run_cycle(tickers: list[str], threshold: float, risk_pct: float, stop_pct: f
     return probabilities
 
 
-def login() -> bool:
-    required = secret("Harsha@2012")
-    if not required:
-        st.error("APP_PASSWORD should/must be set in Streamlit secrets before this application can be unlocked.")
-        return False
-    if st.session_state.get("authenticated"):
-        return True
-    st.title("🔐 Quant Barrier Trader")
-    supplied = st.text_input("Application password", type="password")
-    if st.button("Unlock", type="primary"):
-        if hashlib.sha256(supplied.encode()).digest() == hashlib.sha256(str(required).encode()).digest():
-            st.session_state.authenticated = True
-            st.rerun()
-        st.error("Invalid password.")
-    return False
-
-
 def main() -> None:
-    if not login():
-        return
     st.session_state.setdefault("models", {})
     st.session_state.setdefault("logs", [])
     st.session_state.setdefault("last_probabilities", {})
